@@ -13,32 +13,30 @@ lazy_static! {
     };
 }
 
-pub fn report_coverage(mutations: Range<usize>) {
+pub fn report_coverage(already_checked: &AtomicBool, mutations: Range<usize>) {
     let mutagen_coverage = env::var_os("MUTAGEN_COVERAGE");
     if mutagen_coverage.is_none() {
         return
     }
 
-    if let Some(ab) = COVERAGE_ALREADY_CHECKED.get(mutations.start) {
-        if ab.compare_and_swap(false, true, Ordering::SeqCst) == false {
-            if let Some(_) = mutagen_coverage {
-                // TODO: Should parse the env var and check the reporting strategy: file, socket, ...
-                let muts: Vec<String> = mutations
-                    .map(|n| format!("{}", n))
-                    .collect();
+    if already_checked.compare_and_swap(false, true, Ordering::SeqCst) == false {
+        if let Some(_) = mutagen_coverage {
+            // TODO: Should parse the env var and check the reporting strategy: file, socket, ...
+            let muts: Vec<String> = mutations
+                .map(|n| format!("{}", n))
+                .collect();
 
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .truncate(false)
-                    .open("target/mutagen/coverage.txt")
-                    .and_then(|mut f| {
-                        let mut joined = muts.join(",");
-                        joined.push_str(",");
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .truncate(false)
+                .open("target/mutagen/coverage.txt")
+                .and_then(|mut f| {
+                    let mut joined = muts.join(",");
+                    joined.push_str(",");
 
-                        f.write_all(joined.as_bytes())
-                    });
-            }
+                    f.write_all(joined.as_bytes())
+                });
         }
     }
 }

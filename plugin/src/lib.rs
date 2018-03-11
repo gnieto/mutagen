@@ -16,7 +16,7 @@ use syntax::fold::{self, Folder};
 use syntax::ptr::P;
 use syntax::symbol::Symbol;
 use syntax::util::small_vector::SmallVector;
-use syntax::ast::{IntTy, LitIntType, LitKind, UnOp};
+use syntax::ast::{IntTy, LitIntType, LitKind, UnOp, Ident};
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut Registry) {
@@ -195,9 +195,10 @@ impl<'a, 'cx> MutatorPlugin<'a, 'cx> {
                     }
 
                     let current = self.current_count;
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     mut_expression = quote_expr!(self.cx,
                                     {
-                                        ::mutagen::report_coverage($n..$current);
+                                        ::mutagen::report_coverage(&$ident, $n..$current);
 
                                         if ::mutagen::now($n) { $lit - 1 }
                                         else { $mut_expression }
@@ -218,9 +219,10 @@ impl<'a, 'cx> MutatorPlugin<'a, 'cx> {
                     }
 
                     let current = self.current_count;
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     mut_expression = quote_expr!(self.cx,
                                     {
-                                        ::mutagen::report_coverage($n..$current);
+                                        ::mutagen::report_coverage(&$ident, $n..$current);
 
                                         if ::mutagen::now($n) { $lit + 1 }
                                         else { $mut_expression }
@@ -231,6 +233,106 @@ impl<'a, 'cx> MutatorPlugin<'a, 'cx> {
             }
             _ => None,
         }
+    }
+
+    fn fold_first_block(&mut self, block: P<Block>) -> P<Block> {
+        let mut pre_stmts = vec![];
+        let first_mutation = self.current_count;
+
+        {
+            if let Some(&MethodInfo {
+                is_default,
+                ref have_output_type,
+                ref interchangeables,
+            }) = self.info.method_infos.last()
+                {
+                    if is_default {
+                        let n = self.current_count;
+                        add_mutations(
+                            &self.cx,
+                            &mut self.mutations,
+                            &mut self.current_count,
+                            block.span,
+                            &["insert return default()"],
+                        );
+                        pre_stmts.push(
+                            quote_stmt!(self.cx,
+                if ::mutagen::now($n) { return Default::default(); })
+                                .unwrap(),
+                        );
+                    }
+                    for name in have_output_type {
+                        let n = self.current_count;
+                        let ident = name.to_ident();
+                        add_mutations(
+                            &self.cx,
+                            &mut self.mutations,
+                            &mut self.current_count,
+                            block.span,
+                            &[&format!("insert return {}", name)],
+                        );
+                        pre_stmts.push(
+                            quote_stmt!(self.cx,
+                if ::mutagen::now($n) { return $ident; })
+                                .unwrap(),
+                        );
+                    }
+                    for (ref key, ref values) in interchangeables {
+                        for value in values.iter() {
+                            let n = self.current_count;
+                            let key_ident = key.to_ident();
+                            let value_ident = value.to_ident();
+                            add_mutations(
+                                &self.cx,
+                                &mut self.mutations,
+                                &mut self.current_count,
+                                block.span,
+                                &[&format!("exchange {} with {}", key.as_str(), value_ident)],
+                            );
+                            pre_stmts.push(
+                                quote_stmt!(self.cx,
+                        if ::mutagen::now($n) {
+                            let ($key_ident, $value_ident) = ($value_ident, $key_ident)
+                         }).unwrap(),
+                            );
+                        }
+                    }
+                    //let ($a, $b) = if mutagen::now($n) { ($b, $a) } else { ($a, $b) };
+                    //TODO: switch interchangeables, need mutability info, too
+                    //for name in method_info.interchangeables { }
+                }
+        }
+        block.map(
+            |Block {
+                 stmts,
+                 id,
+                 rules,
+                 span,
+                 recovered,
+             }| {
+                let mut newstmts: Vec<Stmt> = Vec::with_capacity(pre_stmts.len() + stmts.len());
+                let mutated_stmts: Vec<Stmt> = stmts.into_iter().flat_map(|s| fold::noop_fold_stmt(s, self)).collect();
+                let last_mutation = self.current_count;
+                newstmts.extend((first_mutation..last_mutation).map(|i| {
+                    let s = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", i));
+
+                    quote_stmt!(self.cx,
+                     #[allow(dead_code)]
+                     static $s : ::std::sync::atomic::AtomicBool = ::std::sync::atomic::ATOMIC_BOOL_INIT;
+                    ).unwrap()
+                }));
+                newstmts.extend(pre_stmts);
+                newstmts.extend(mutated_stmts);
+
+                Block {
+                    stmts: newstmts,
+                    id,
+                    rules,
+                    span,
+                    recovered,
+                }
+            },
+        )
     }
 }
 
@@ -265,7 +367,7 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     ident,
                     attrs,
                     generics,
-                    node: TraitItemKind::Method(sig, Some(fold_first_block(block, self))),
+                    node: TraitItemKind::Method(sig, Some(self.fold_first_block(block))),
                     span,
                     tokens,
                 };
@@ -308,7 +410,7 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     constness,
                     abi,
                     generics,
-                    fold_first_block(block, self),
+                    self.fold_first_block(block),
                 );
                 self.end_fn();
                 k
@@ -356,8 +458,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         (match ($left, ::mutagen::diff($n)) {
                                 (_, 0) => false,
                                 (_, 1) => true,
@@ -388,8 +491,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         (match ($left, ::mutagen::diff($n)) {
                             (_, 0) => false,
                             (_, 1) => true,
@@ -418,8 +522,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::eq($left, $right, $n)
                     })
                 }
@@ -442,8 +547,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::ne($left, $right, $n)
                     })
                 }
@@ -470,8 +576,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::gt($left, $right, $n)
                     })
                 }
@@ -498,8 +605,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::gt($right, $left, $n)
                     })
                 }
@@ -526,8 +634,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n..$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::ge($left, $right, $n)
                     })
                 }
@@ -554,8 +663,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                     let current = self.current_count;
                     let left = self.fold_expr(left);
                     let right = self.fold_expr(right);
+                    let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                     quote_expr!(self.cx, {
-                        ::mutagen::report_coverage($n...$current);
+                        ::mutagen::report_coverage(&$ident, $n..$current);
                         ::mutagen::ge($right, $left, $n)
                     })
                 }
@@ -594,8 +704,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                 let cond = self.fold_expr(cond);
                 let then = fold::noop_fold_block(then, self);
                 let opt_else = opt_else.map(|p_else| self.fold_expr(p_else));
+                let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                 let mut_cond = quote_expr!(self.cx, {
-                    ::mutagen::report_coverage($n..$current);
+                    ::mutagen::report_coverage(&$ident, $n..$current);
                     ::mutagen::t($cond, $n)
                 });
 
@@ -626,8 +737,9 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                 let current = self.current_count;
                 let cond = self.fold_expr(cond);
                 let block = fold::noop_fold_block(block, self);
+                let ident = Ident::from_str(&format!("MUTAGEN_COVERAGE_{}", n));
                 let mut_cond = quote_expr!(self.cx, {
-                    ::mutagen::report_coverage($n..$current);
+                    ::mutagen::report_coverage(&$ident, $n..$current);
                     ::mutagen::w($cond, $n)
                 });
                 P(Expr {
@@ -721,103 +833,6 @@ fn int_constant_can_add_one(i: u64, ty: LitIntType) -> bool {
     };
 
     i < max
-}
-
-fn fold_first_block(block: P<Block>, m: &mut MutatorPlugin) -> P<Block> {
-    let mut pre_stmts = vec![];
-    {
-        let MutatorPlugin {
-            ref mut cx,
-            ref info,
-            ref mut mutations,
-            ref mut current_count,
-        } = *m;
-        if let Some(&MethodInfo {
-            is_default,
-            ref have_output_type,
-            ref interchangeables,
-        }) = info.method_infos.last()
-        {
-            if is_default {
-                let n = *current_count;
-                add_mutations(
-                    cx,
-                    mutations,
-                    current_count,
-                    block.span,
-                    &["insert return default()"],
-                );
-                pre_stmts.push(
-                    quote_stmt!(cx,
-                if ::mutagen::now($n) { return Default::default(); })
-                        .unwrap(),
-                );
-            }
-            for name in have_output_type {
-                let n = *current_count;
-                let ident = name.to_ident();
-                add_mutations(
-                    cx,
-                    mutations,
-                    current_count,
-                    block.span,
-                    &[&format!("insert return {}", name)],
-                );
-                pre_stmts.push(
-                    quote_stmt!(cx,
-                if ::mutagen::now($n) { return $ident; })
-                        .unwrap(),
-                );
-            }
-            for (ref key, ref values) in interchangeables {
-                for value in values.iter() {
-                    let n = *current_count;
-                    let key_ident = key.to_ident();
-                    let value_ident = value.to_ident();
-                    add_mutations(
-                        cx,
-                        mutations,
-                        current_count,
-                        block.span,
-                        &[&format!("exchange {} with {}", key.as_str(), value_ident)],
-                    );
-                    pre_stmts.push(
-                        quote_stmt!(cx,
-                        if ::mutagen::now($n) { 
-                            let ($key_ident, $value_ident) = ($value_ident, $key_ident)
-                         }).unwrap(),
-                    );
-                }
-            }
-            //let ($a, $b) = if mutagen::now($n) { ($b, $a) } else { ($a, $b) };
-            //TODO: switch interchangeables, need mutability info, too
-            //for name in method_info.interchangeables { }
-        }
-    }
-    if pre_stmts.is_empty() {
-        fold::noop_fold_block(block, m)
-    } else {
-        block.map(
-            |Block {
-                 stmts,
-                 id,
-                 rules,
-                 span,
-                 recovered,
-             }| {
-                let mut newstmts: Vec<Stmt> = Vec::with_capacity(pre_stmts.len() + stmts.len());
-                newstmts.extend(pre_stmts);
-                newstmts.extend(stmts.into_iter().flat_map(|s| fold::noop_fold_stmt(s, m)));
-                Block {
-                    stmts: newstmts,
-                    id,
-                    rules,
-                    span,
-                    recovered,
-                }
-            },
-        )
-    }
 }
 
 fn add_mutations(
